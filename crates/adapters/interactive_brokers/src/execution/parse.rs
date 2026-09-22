@@ -18,7 +18,7 @@
 use std::str::FromStr;
 
 use anyhow::Context;
-use ibapi::orders::{Execution, OrderStatus};
+use ibapi::orders::{Execution, Liquidity, OrderData, OrderStatus};
 use jiff::{
     Timestamp,
     civil::DateTime,
@@ -40,10 +40,48 @@ use rust_decimal::Decimal;
 use crate::{
     common::{
         enums::{IbAction, IbOrderStatus, IbOrderType, IbTimeInForce},
-        parse::is_spread_instrument_id,
+        spreads::is_spread_instrument_id,
     },
+    execution::transform::ib_trigger_method_to_trigger_type,
     providers::instruments::InteractiveBrokersInstrumentProvider,
 };
+
+pub(super) fn parse_order_data_to_report(
+    data: &OrderData,
+    instrument_id: InstrumentId,
+    account_id: AccountId,
+    instrument_provider: &InteractiveBrokersInstrumentProvider,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderStatusReport> {
+    anyhow::ensure!(
+        data.order.total_quantity.is_finite()
+            && data.order.total_quantity >= 0.0
+            && data.order.filled_quantity.is_finite()
+            && data.order.filled_quantity >= 0.0,
+        "IB order {} has invalid quantities",
+        data.order_id
+    );
+    parse_order_status_to_report(
+        &OrderStatus {
+            order_id: data.order_id,
+            status: data.order_state.status.clone(),
+            filled: data.order.filled_quantity,
+            remaining: (data.order.total_quantity - data.order.filled_quantity).max(0.0),
+            average_fill_price: None,
+            perm_id: data.order.perm_id,
+            parent_id: 0,
+            last_fill_price: None,
+            client_id: data.order.client_id,
+            why_held: String::new(),
+            market_cap_price: None,
+        },
+        Some(&data.order),
+        instrument_id,
+        account_id,
+        instrument_provider,
+        ts_init,
+    )
+}
 
 pub(crate) fn should_use_avg_fill_price(avg_fill_price: f64, instrument_id: &InstrumentId) -> bool {
     avg_fill_price.is_finite()
@@ -125,6 +163,7 @@ pub fn parse_execution_to_fill_report(
     let venue_order_id = ib_venue_order_id(execution.order_id, execution.perm_id);
 
     let client_order_id = normalized_order_ref(&execution.order_reference).map(ClientOrderId::new);
+    let liquidity_side = execution_liquidity_side(&execution.last_liquidity);
 
     let mut report = FillReport::new(
         account_id,
@@ -135,7 +174,7 @@ pub fn parse_execution_to_fill_report(
         last_qty,
         last_px,
         commission_money,
-        LiquiditySide::NoLiquiditySide,
+        liquidity_side,
         client_order_id,
         None, // venue_position_id
         ts_event,
@@ -145,6 +184,24 @@ pub fn parse_execution_to_fill_report(
     report.avg_px = avg_px.map(|price: Price| price.as_decimal());
 
     Ok(report)
+}
+
+fn execution_liquidity_side(liquidity: &Liquidity) -> LiquiditySide {
+    match liquidity {
+        Liquidity::AddedLiquidity => LiquiditySide::Maker,
+        Liquidity::RemovedLiquidity => LiquiditySide::Taker,
+        Liquidity::None => LiquiditySide::NoLiquiditySide,
+        Liquidity::LiquidityRoutedOut => {
+            tracing::warn!(
+                "IB execution liquidity was routed out and has no maker/taker representation"
+            );
+            LiquiditySide::NoLiquiditySide
+        }
+        Liquidity::Unknown(code) => {
+            tracing::warn!("IB execution used unknown liquidity code {code}");
+            LiquiditySide::NoLiquiditySide
+        }
+    }
 }
 
 /// Parse an IB order status to a Nautilus OrderStatusReport.
@@ -193,11 +250,11 @@ pub fn parse_order_status_to_report(
         .map_or(0, |instr| instr.price_precision());
 
     // Get quantity
-    let quantity = if let Some(order) = order {
-        Quantity::new(order.total_quantity, size_precision)
-    } else {
-        Quantity::zero(size_precision)
-    };
+    let total_quantity = order.map_or(0.0, |order| order.total_quantity);
+    let quantity = Quantity::new(
+        total_quantity.max(order_status.filled + order_status.remaining),
+        size_precision,
+    );
 
     // Get filled quantity
     let filled_qty = Quantity::new(order_status.filled, size_precision);
@@ -225,9 +282,9 @@ pub fn parse_order_status_to_report(
         .map(ClientOrderId::new);
 
     // Map order type from IB order if available
-    let order_type = order
-        .map(|order| map_ib_order_type(&order.order_type, order.limit_price))
-        .unwrap_or(OrderType::Market);
+    let order_type = order.map_or(OrderType::Market, |order| {
+        map_ib_order_type(&order.order_type, order.limit_price)
+    });
 
     // Map time in force from IB order if available
     let time_in_force = if let Some(order) = order {
@@ -273,6 +330,19 @@ pub fn parse_order_status_to_report(
             report = report.with_trigger_price(trigger_price);
         }
 
+        if matches!(
+            order_type,
+            OrderType::LimitIfTouched
+                | OrderType::MarketIfTouched
+                | OrderType::StopLimit
+                | OrderType::StopMarket
+                | OrderType::TrailingStopLimit
+                | OrderType::TrailingStopMarket
+        ) {
+            report =
+                report.with_trigger_type(ib_trigger_method_to_trigger_type(order.trigger_method));
+        }
+
         if let Some(limit_offset) = limit_offset {
             report = report.with_limit_offset(limit_offset);
         }
@@ -302,6 +372,7 @@ fn map_ib_order_type(order_type: &str, limit_price: Option<f64>) -> OrderType {
     }
 }
 
+#[allow(clippy::type_complexity)] // The tuple mirrors the four optional IB pricing fields.
 fn parse_ib_order_pricing_fields(
     order: &ibapi::orders::Order,
     order_type: OrderType,
@@ -468,7 +539,7 @@ mod tests {
         orders::{Action, ExecutionSide, Liquidity, Order, OrderStatusKind},
     };
     use nautilus_model::{
-        enums::TrailingOffsetType,
+        enums::{TrailingOffsetType, TriggerType},
         identifiers::{Symbol, Venue},
         instruments::{InstrumentAny, stubs::equity_aapl},
     };
@@ -640,8 +711,7 @@ mod tests {
             let error_msg = e.to_string();
             assert!(
                 error_msg.contains("not found") || error_msg.contains("instrument"),
-                "Unexpected error: {}",
-                error_msg
+                "Unexpected error: {error_msg}"
             );
         }
     }
@@ -680,8 +750,7 @@ mod tests {
             let error_msg = e.to_string();
             assert!(
                 error_msg.contains("not found") || error_msg.contains("instrument"),
-                "Unexpected error: {}",
-                error_msg
+                "Unexpected error: {error_msg}"
             );
         }
     }
@@ -690,7 +759,7 @@ mod tests {
     fn test_parse_order_status_to_report_spread_allows_negative_avg_fill_price() {
         let instrument_provider = create_test_instrument_provider();
         let instrument_id = InstrumentId::new(
-            Symbol::from("(1)SPY C400_((1))SPY C410"),
+            Symbol::from("(1)SPY C400___((1))SPY C410"),
             Venue::from("SMART"),
         );
         let account_id = AccountId::from("IB-001");
@@ -802,6 +871,68 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_order_status_to_report_recovers_completed_order_quantity() {
+        let instrument_provider = create_test_instrument_provider();
+        let instrument_id = create_test_instrument_id();
+        let order_status = OrderStatus {
+            status: OrderStatusKind::Filled,
+            filled: 3.0,
+            remaining: 0.0,
+            ..Default::default()
+        };
+        let order = Order {
+            total_quantity: 0.0,
+            filled_quantity: 3.0,
+            ..Default::default()
+        };
+
+        let report = parse_order_status_to_report(
+            &order_status,
+            Some(&order),
+            instrument_id,
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(report.quantity, Quantity::from(3));
+        assert_eq!(report.filled_qty, Quantity::from(3));
+    }
+
+    #[rstest]
+    fn test_parse_order_status_to_report_sets_stop_trigger_type() {
+        let instrument_provider = create_test_instrument_provider();
+        let instrument_id = create_test_instrument_id();
+        let order_status = OrderStatus {
+            status: OrderStatusKind::Cancelled,
+            remaining: 1.0,
+            ..Default::default()
+        };
+        let order = Order {
+            total_quantity: 1.0,
+            order_type: "STP".to_string(),
+            aux_price: Some(100.0),
+            trigger_method: ibapi::orders::conditions::TriggerMethod::Last,
+            ..Default::default()
+        };
+
+        let report = parse_order_status_to_report(
+            &order_status,
+            Some(&order),
+            instrument_id,
+            AccountId::from("IB-001"),
+            &instrument_provider,
+            UnixNanos::new(0),
+        )
+        .unwrap();
+
+        assert_eq!(report.order_type, OrderType::StopMarket);
+        assert_eq!(report.trigger_price, Some(Price::new(100.0, 0)));
+        assert_eq!(report.trigger_type, Some(TriggerType::LastPrice));
+    }
+
+    #[rstest]
     fn test_ib_venue_order_id_prefers_perm_id_and_falls_back_to_order_id() {
         assert_eq!(ib_venue_order_id(123, 456).to_string(), "PERM-456");
         assert_eq!(ib_venue_order_id(123, 0).to_string(), "123");
@@ -815,18 +946,42 @@ mod tests {
     }
 
     #[rstest]
+    #[case(Liquidity::AddedLiquidity, LiquiditySide::Maker)]
+    #[case(Liquidity::RemovedLiquidity, LiquiditySide::Taker)]
+    #[case(Liquidity::None, LiquiditySide::NoLiquiditySide)]
+    #[case(Liquidity::LiquidityRoutedOut, LiquiditySide::NoLiquiditySide)]
+    #[case(Liquidity::Unknown(4), LiquiditySide::NoLiquiditySide)]
+    fn test_execution_liquidity_side(
+        #[case] liquidity: Liquidity,
+        #[case] expected: LiquiditySide,
+    ) {
+        assert_eq!(execution_liquidity_side(&liquidity), expected);
+    }
+
+    struct PricingExpectation {
+        order_type: OrderType,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        limit_offset: Option<Decimal>,
+        trailing_offset: Option<Decimal>,
+        trailing_offset_type: Option<TrailingOffsetType>,
+    }
+
+    #[rstest]
     #[case(
         "MKT",
         None,
         None,
         None,
         None,
-        OrderType::Market,
-        None,
-        None,
-        None,
-        None,
-        None
+        PricingExpectation {
+            order_type: OrderType::Market,
+            price: None,
+            trigger_price: None,
+            limit_offset: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+        }
     )]
     #[case(
         "LMT",
@@ -834,12 +989,14 @@ mod tests {
         None,
         None,
         None,
-        OrderType::Limit,
-        Some(Price::new(185.0, 0)),
-        None,
-        None,
-        None,
-        None
+        PricingExpectation {
+            order_type: OrderType::Limit,
+            price: Some(Price::new(185.0, 0)),
+            trigger_price: None,
+            limit_offset: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+        }
     )]
     #[case(
         "IBALGO",
@@ -847,12 +1004,14 @@ mod tests {
         None,
         None,
         None,
-        OrderType::Limit,
-        Some(Price::new(185.0, 0)),
-        None,
-        None,
-        None,
-        None
+        PricingExpectation {
+            order_type: OrderType::Limit,
+            price: Some(Price::new(185.0, 0)),
+            trigger_price: None,
+            limit_offset: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+        }
     )]
     #[case(
         "IBALGO",
@@ -860,12 +1019,14 @@ mod tests {
         None,
         None,
         None,
-        OrderType::Market,
-        None,
-        None,
-        None,
-        None,
-        None
+        PricingExpectation {
+            order_type: OrderType::Market,
+            price: None,
+            trigger_price: None,
+            limit_offset: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+        }
     )]
     #[case(
         "MIT",
@@ -873,12 +1034,14 @@ mod tests {
         Some(180.0),
         None,
         None,
-        OrderType::MarketIfTouched,
-        None,
-        Some(Price::new(180.0, 0)),
-        None,
-        None,
-        None
+        PricingExpectation {
+            order_type: OrderType::MarketIfTouched,
+            price: None,
+            trigger_price: Some(Price::new(180.0, 0)),
+            limit_offset: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+        }
     )]
     #[case(
         "LIT",
@@ -886,12 +1049,14 @@ mod tests {
         Some(180.0),
         None,
         None,
-        OrderType::LimitIfTouched,
-        Some(Price::new(179.0, 0)),
-        Some(Price::new(180.0, 0)),
-        None,
-        None,
-        None
+        PricingExpectation {
+            order_type: OrderType::LimitIfTouched,
+            price: Some(Price::new(179.0, 0)),
+            trigger_price: Some(Price::new(180.0, 0)),
+            limit_offset: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+        }
     )]
     #[case(
         "STP",
@@ -899,12 +1064,14 @@ mod tests {
         Some(180.0),
         None,
         None,
-        OrderType::StopMarket,
-        None,
-        Some(Price::new(180.0, 0)),
-        None,
-        None,
-        None
+        PricingExpectation {
+            order_type: OrderType::StopMarket,
+            price: None,
+            trigger_price: Some(Price::new(180.0, 0)),
+            limit_offset: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+        }
     )]
     #[case(
         "STP LMT",
@@ -912,12 +1079,14 @@ mod tests {
         Some(180.0),
         None,
         None,
-        OrderType::StopLimit,
-        Some(Price::new(179.0, 0)),
-        Some(Price::new(180.0, 0)),
-        None,
-        None,
-        None
+        PricingExpectation {
+            order_type: OrderType::StopLimit,
+            price: Some(Price::new(179.0, 0)),
+            trigger_price: Some(Price::new(180.0, 0)),
+            limit_offset: None,
+            trailing_offset: None,
+            trailing_offset_type: None,
+        }
     )]
     #[case(
         "TRAIL LIMIT",
@@ -925,12 +1094,14 @@ mod tests {
         Some(2.5),
         Some(185.0),
         Some(0.25),
-        OrderType::TrailingStopLimit,
-        None,
-        Some(Price::new(185.0, 0)),
-        Some(Decimal::from_str("0.25").unwrap()),
-        Some(Decimal::from_str("2.5").unwrap()),
-        Some(TrailingOffsetType::Price),
+        PricingExpectation {
+            order_type: OrderType::TrailingStopLimit,
+            price: None,
+            trigger_price: Some(Price::new(185.0, 0)),
+            limit_offset: Some(Decimal::from_str("0.25").unwrap()),
+            trailing_offset: Some(Decimal::from_str("2.5").unwrap()),
+            trailing_offset_type: Some(TrailingOffsetType::Price),
+        },
     )]
     fn test_parse_order_status_to_report_maps_pricing_fields_by_order_type(
         #[case] ib_order_type: &str,
@@ -938,12 +1109,7 @@ mod tests {
         #[case] aux_price: Option<f64>,
         #[case] trail_stop_price: Option<f64>,
         #[case] limit_price_offset: Option<f64>,
-        #[case] expected_order_type: OrderType,
-        #[case] expected_price: Option<Price>,
-        #[case] expected_trigger_price: Option<Price>,
-        #[case] expected_limit_offset: Option<Decimal>,
-        #[case] expected_trailing_offset: Option<Decimal>,
-        #[case] expected_trailing_offset_type: Option<TrailingOffsetType>,
+        #[case] expected: PricingExpectation,
     ) {
         let instrument_provider = create_test_instrument_provider();
         let instrument_id = create_test_instrument_id();
@@ -985,12 +1151,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.order_type, expected_order_type);
-        assert_eq!(report.price, expected_price);
-        assert_eq!(report.trigger_price, expected_trigger_price);
-        assert_eq!(report.limit_offset, expected_limit_offset);
-        assert_eq!(report.trailing_offset, expected_trailing_offset);
-        assert_eq!(report.trailing_offset_type, expected_trailing_offset_type);
+        assert_eq!(report.order_type, expected.order_type);
+        assert_eq!(report.price, expected.price);
+        assert_eq!(report.trigger_price, expected.trigger_price);
+        assert_eq!(report.limit_offset, expected.limit_offset);
+        assert_eq!(report.trailing_offset, expected.trailing_offset);
+        assert_eq!(report.trailing_offset_type, expected.trailing_offset_type);
     }
 
     #[rstest]
@@ -1094,8 +1260,7 @@ mod tests {
                 let error_msg = e.to_string();
                 assert!(
                     error_msg.contains("not found") || error_msg.contains("instrument"),
-                    "Unexpected error: {}",
-                    error_msg
+                    "Unexpected error: {error_msg}"
                 );
             }
             Ok(fill) => {
@@ -1203,8 +1368,7 @@ mod tests {
                 let error_msg = e.to_string();
                 assert!(
                     error_msg.contains("not found") || error_msg.contains("instrument"),
-                    "Unexpected error: {}",
-                    error_msg
+                    "Unexpected error: {error_msg}"
                 );
             }
             Ok(fill) => {

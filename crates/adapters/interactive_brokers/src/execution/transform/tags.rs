@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Interactive Brokers order tag parsing and application.
+
 use std::str::FromStr;
 
 use anyhow::Context;
