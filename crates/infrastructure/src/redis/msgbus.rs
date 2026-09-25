@@ -304,7 +304,7 @@ impl RedisMessageBusBacking {
         let (stream_rx, stream_handle) = if external_streams.is_empty() {
             (None, None)
         } else {
-            let stream_signal_clone = stream_signal.clone();
+            let stream_signal_clone = Arc::clone(&stream_signal);
             let (stream_tx, stream_rx) = tokio::sync::mpsc::channel::<BusMessage>(100_000);
             (
                 Some(stream_rx),
@@ -326,7 +326,7 @@ impl RedisMessageBusBacking {
         // Create heartbeat task
         let heartbeat_signal = Arc::new(AtomicBool::new(false));
         let heartbeat_handle = if let Some(heartbeat_interval_secs) = heartbeat_interval_secs {
-            let signal = heartbeat_signal.clone();
+            let signal = Arc::clone(&heartbeat_signal);
             let pub_tx_clone = pub_tx.clone();
 
             Some(get_runtime().spawn(async move {
@@ -1429,7 +1429,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_retry_delay_returns_false_when_signaled() {
         let stream_signal = Arc::new(AtomicBool::new(true));
-        let signal = stream_signal.clone();
+        let signal = Arc::clone(&stream_signal);
         let fut = async move { wait_for_retry_delay(Duration::from_secs(30), &signal).await };
 
         let handle = tokio::spawn(fut);
