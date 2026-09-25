@@ -500,7 +500,7 @@ mod tests {
                 if field.name() == "ts_init" {
                     Arc::new(field.as_ref().clone().with_nullable(true))
                 } else {
-                    field.clone()
+                    Arc::clone(field)
                 }
             })
             .collect::<Vec<_>>();
@@ -549,7 +549,7 @@ mod tests {
                     if schema_field.name() == field {
                         Arc::new(schema_field.as_ref().clone().with_nullable(true))
                     } else {
-                        schema_field.clone()
+                        Arc::clone(schema_field)
                     }
                 })
                 .collect::<Vec<_>>();
